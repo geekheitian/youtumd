@@ -13,6 +13,7 @@ youtumd - YouTube Video Summary Tool
     python youtumd.py --dry-run           # 预览模式（不下字幕）
     python youtumd.py --limit 5           # 限制处理数量
     python youtumd.py --channel CHANNEL   # 处理其他频道
+    python youtumd.py --url 'https://www.youtube.com/watch?v=VIDEO_ID' --base-dir /tmp/vault-test
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -55,12 +57,17 @@ from libs.config import (
     choose_subtitle_option,
     find_existing_subtitle,
     find_existing_summary,
+    folder_name_for_single_video,
     get_channel_name,
     get_env_int,
     get_env_path,
     get_video_dates,
     load_config,
+    load_dotenv,
+    parse_ytdlp_json_text,
+    parse_ytdlp_video_info,
     sanitize_filename,
+    yaml_quote,
 )
 from libs.transcript import (
     build_cookie_args,
@@ -276,6 +283,131 @@ def get_channel_videos(
     return videos
 
 
+_YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "music.youtube.com",
+}
+
+
+def _youtube_host(url: str) -> str:
+    host = urllib.parse.urlparse(url.strip()).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.startswith("m."):
+        host = host[2:]
+    return host
+
+
+def extract_youtube_video_id(url: str) -> Optional[str]:
+    """Return a video id from a watch, share, shorts, embed, or live URL."""
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    host = _youtube_host(raw)
+    if host not in _YOUTUBE_HOSTS:
+        return None
+
+    if host == "youtu.be":
+        candidate = parsed.path.strip("/").split("/")[0]
+        return candidate if _YOUTUBE_ID_RE.match(candidate) else None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if parts and parts[0] in {"shorts", "embed", "live", "v"} and len(parts) >= 2:
+        candidate = parts[1]
+        return candidate if _YOUTUBE_ID_RE.match(candidate) else None
+
+    video_ids = urllib.parse.parse_qs(parsed.query).get("v") or []
+    if video_ids and _YOUTUBE_ID_RE.match(video_ids[0]):
+        return video_ids[0]
+    return None
+
+
+def fetch_single_video(
+    url: str,
+    cookies_file: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    """Fetch one YouTube video into the same dict shape as get_channel_videos."""
+    cleaned = (url or "").strip()
+    if not extract_youtube_video_id(cleaned):
+        print("   ❌ 不是有效的 YouTube 视频链接；频道请使用 --channel")
+        return None
+
+    print(f"🔗 获取单个视频: {cleaned}")
+    cmd = [
+        "yt-dlp",
+        *build_cookie_args(cookies_file, cookies_from_browser),
+        "--skip-download",
+        "--no-playlist",
+        "--no-warnings",
+        "-J",
+        cleaned,
+    ]
+    output = run_command(cmd)
+    video = parse_ytdlp_json_text(output) if output else None
+    if not video:
+        print("   ❌ 无法解析视频元数据")
+        return None
+    print(f"   {video['title']}")
+    return video
+
+
+def build_context_for_single_video(video: Dict[str, str], config: AppConfig) -> ChannelContext:
+    """Build a channel folder from video metadata, or ``single`` when unknown."""
+    name = folder_name_for_single_video(video.get("channel", ""), video.get("channel_url", ""))
+    channel_url = (video.get("channel_url") or "").strip()
+    if not channel_url:
+        channel_url = f"https://www.youtube.com/watch?v={video['id']}"
+    return ChannelContext(
+        url=channel_url,
+        name=name,
+        content_root=config.content_root,
+    )
+
+
+def run_single_video(
+    url: str,
+    config: AppConfig,
+    dry_run: bool = False,
+    force: bool = False,
+    cookies_file: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
+) -> None:
+    """Process one YouTube URL through the existing process_video path."""
+    video = fetch_single_video(url, cookies_file, cookies_from_browser)
+    if not video:
+        print("❌ 无法获取该视频")
+        return
+
+    context = build_context_for_single_video(video, config)
+    context.subtitles_dir.mkdir(parents=True, exist_ok=True)
+    context.summaries_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 50)
+    print(f"🎬 单视频：{context.name}")
+    print("=" * 50)
+
+    processed = 1 if process_video(
+        video,
+        context,
+        config,
+        dry_run,
+        force,
+        cookies_file=cookies_file,
+        cookies_from_browser=cookies_from_browser,
+    ) else 0
+
+    print("\n" + "=" * 50)
+    print(f"✅ 完成！处理了 {processed} 个视频")
+    print(f"📂 字幕目录: {context.subtitles_dir}")
+    print(f"📂 摘要目录: {context.summaries_dir}")
+    print("=" * 50)
+
+
 # ===========================================================================
 # Subtitle Text Processing
 # ===========================================================================
@@ -329,12 +461,12 @@ def convert_subtitle_to_md(
     """将清洗后的字幕文本转换为 Markdown"""
     try:
         md_content = f"""---
-title: {title}
+title: {yaml_quote(title)}
 source: https://www.youtube.com/watch?v={video_id}
-channel: {context.name}
-channel_url: {context.url}
+channel: {yaml_quote(context.name)}
+channel_url: {yaml_quote(context.url)}
 type: subtitle
-language: {lang}
+language: {yaml_quote(lang)}
 created: {publish_dates['compact']}
 ---
 
@@ -376,17 +508,17 @@ def build_summary_markdown(
     """将摘要内容组装为 Obsidian Markdown"""
     date_str = publish_dates['display']
     return f"""---
-title: {title}
+title: {yaml_quote(title)}
 source: https://www.youtube.com/watch?v={video_id}
-channel: {context.name}
-channel_url: {context.url}
-author: {context.display_name}
+channel: {yaml_quote(context.name)}
+channel_url: {yaml_quote(context.url)}
+author: {yaml_quote(context.display_name)}
 published: {date_str}
 created: {date_str}
 tags:
   - youtube
-  - {context.tag_name}
-summary_provider: {provider_name}
+  - {yaml_quote(context.tag_name)}
+summary_provider: {yaml_quote(provider_name)}
 ---
 
 # {title}
@@ -970,16 +1102,16 @@ def generate_basic_summary(
     preview = subtitle_text[:2000]
 
     summary = f"""---
-title: {title}
+title: {yaml_quote(title)}
 source: https://www.youtube.com/watch?v={video_id}
-channel: {context.name}
-channel_url: {context.url}
-author: {context.display_name}
+channel: {yaml_quote(context.name)}
+channel_url: {yaml_quote(context.url)}
+author: {yaml_quote(context.display_name)}
 published: {date_str}
 created: {date_str}
 tags:
   - youtube
-  - {context.tag_name}
+  - {yaml_quote(context.tag_name)}
 ---
 
 # {title}
@@ -1367,8 +1499,23 @@ def main() -> None:
     load_dotenv()
     config = load_config()
 
-    parser = argparse.ArgumentParser(description="YouTube 视频字幕摘要工具")
-    parser.add_argument("--channel", "-c", default=config.default_channel_url, help="YouTube 频道 URL")
+    parser = argparse.ArgumentParser(
+        description="YouTube 视频字幕摘要工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  python3 youtumd.py --url 'https://www.youtube.com/watch?v=VIDEO_ID' "
+            "--base-dir /tmp/vault-test\n"
+            "  python3 youtumd.py --url 'https://www.youtube.com/watch?v=VIDEO_ID' --dry-run\n"
+        ),
+    )
+    parser.add_argument("--url", help="处理单个 YouTube 视频 URL（与 --channel / --all-channels 互斥）")
+    parser.add_argument(
+        "--channel",
+        "-c",
+        default=None,
+        help=f"YouTube 频道 URL（默认: {config.default_channel_url}）",
+    )
     parser.add_argument("--limit", "-l", type=int, default=config.default_limit, help="处理视频数量")
     parser.add_argument("--base-dir", help="覆盖输出根目录")
     parser.add_argument("--content-subdir", help="覆盖内容子目录")
@@ -1380,6 +1527,9 @@ def main() -> None:
     parser.add_argument("--cookies-from-browser", help="从浏览器读取 cookies")
 
     args = parser.parse_args()
+
+    if args.url and (args.channel is not None or args.all_channels):
+        parser.error("--url 不能与 --channel 或 --all-channels 同时使用")
 
     if args.base_dir:
         config = AppConfig(
@@ -1407,8 +1557,6 @@ def main() -> None:
         args.cookies_from_browser or os.environ.get("YTSUBMD_COOKIES_FROM_BROWSER", "").strip() or None
     )
 
-    context = build_channel_context(args.channel, config)
-
     if args.all_channels:
         process_all_channels(
             config,
@@ -1420,6 +1568,19 @@ def main() -> None:
         )
         return
 
+    if args.url:
+        run_single_video(
+            args.url,
+            config,
+            dry_run=args.dry_run,
+            force=args.force,
+            cookies_file=cookies_file,
+            cookies_from_browser=cookies_from_browser,
+        )
+        return
+
+    channel_url = args.channel or config.default_channel_url
+    context = build_channel_context(channel_url, config)
     context.subtitles_dir.mkdir(parents=True, exist_ok=True)
     context.summaries_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1427,7 +1588,7 @@ def main() -> None:
     print(f"🎬 {context.name} 视频摘要工具")
     print("=" * 50)
 
-    videos = get_channel_videos(args.channel, args.limit, cookies_file, cookies_from_browser)
+    videos = get_channel_videos(channel_url, args.limit, cookies_file, cookies_from_browser)
 
     if not videos:
         print("❌ 无法获取视频列表")

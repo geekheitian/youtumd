@@ -13,6 +13,7 @@ Bilibili 空间字幕摘要工具
     python3 bilibili_tool.py --dry-run
     python3 bilibili_tool.py --limit 3
     python3 bilibili_tool.py --space-url "https://space.bilibili.com/50247550/video"
+    python3 bilibili_tool.py --url "https://www.bilibili.com/video/BV1xx411c7mD" --base-dir /tmp/vault-test
     python3 bilibili_tool.py --cookies-from-browser chrome
     python3 bilibili_tool.py --cookies-file ~/Downloads/bilibili.cookies.txt
 """
@@ -23,6 +24,7 @@ import os
 import re
 import subprocess
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -460,13 +462,13 @@ def convert_subtitle_to_md(
     md_filename = f"{safe_title}-{publish_dates['compact']}-字幕.md"
     md_path = context.subtitles_dir / md_filename
     md_content = f"""---
-title: {title}
+title: {shared.yaml_quote(title)}
 source: {video_url}
-channel: {context.name}
-channel_url: {context.url}
+channel: {shared.yaml_quote(context.name)}
+channel_url: {shared.yaml_quote(context.url)}
 type: subtitle
 platform: bilibili
-language: {lang}
+language: {shared.yaml_quote(lang)}
 created: {publish_dates['compact']}
 ---
 
@@ -498,16 +500,16 @@ def build_summary_markdown(
     """构建摘要 Markdown。"""
     date_str = publish_dates["display"]
     return f"""---
-title: {title}
+title: {shared.yaml_quote(title)}
 source: {video_url}
-channel: {context.name}
-channel_url: {context.url}
-author: {context.name}
+channel: {shared.yaml_quote(context.name)}
+channel_url: {shared.yaml_quote(context.url)}
+author: {shared.yaml_quote(context.name)}
 published: {date_str}
 created: {date_str}
 tags:
   - bilibili
-  - {context.name}
+  - {shared.yaml_quote(context.name)}
 ---
 
 # {title}
@@ -585,16 +587,16 @@ def generate_basic_summary(
     preview = subtitle_text[:2000]
     date_str = publish_dates["display"]
     return f"""---
-title: {title}
+title: {shared.yaml_quote(title)}
 source: {video_url}
-channel: {context.name}
-channel_url: {context.url}
-author: {context.name}
+channel: {shared.yaml_quote(context.name)}
+channel_url: {shared.yaml_quote(context.url)}
+author: {shared.yaml_quote(context.name)}
 published: {date_str}
 created: {date_str}
 tags:
   - bilibili
-  - {context.name}
+  - {shared.yaml_quote(context.name)}
 ---
 
 # {title}
@@ -752,12 +754,164 @@ def process_video(
     return True
 
 
+def _bilibili_host(url: str) -> str:
+    host = urllib.parse.urlparse(url.strip()).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.startswith("m."):
+        host = host[2:]
+    return host
+
+
+def extract_bilibili_video_id(url: str) -> Optional[str]:
+    """Return a BV or av id when the URL contains one. Short links may not."""
+    match = re.search(r"BV[0-9A-Za-z]{10}", url or "")
+    if match:
+        return match.group(0)
+    parsed = urllib.parse.urlparse((url or "").strip())
+    av_match = re.search(r"/av(\d+)", parsed.path, re.IGNORECASE)
+    if av_match:
+        return f"av{av_match.group(1)}"
+    return None
+
+
+def classify_bilibili_target(url: str) -> str:
+    """Return ``video``, ``space``, or ``invalid``."""
+    raw = (url or "").strip()
+    if not raw:
+        return "invalid"
+    host = _bilibili_host(raw)
+    parsed = urllib.parse.urlparse(raw)
+    if host == "space.bilibili.com":
+        return "space"
+    if host == "b23.tv":
+        return "video"
+    if host == "bilibili.com" and (
+        parsed.path.startswith("/video/") or re.search(r"/av\d+", parsed.path, re.IGNORECASE)
+    ):
+        return "video"
+    return "invalid"
+
+
+def fetch_single_video(
+    url: str,
+    cookies_file: Optional[str],
+    cookies_from_browser: Optional[str],
+) -> Optional[Dict[str, str]]:
+    """Fetch one Bilibili video into the same dict shape as get_space_videos."""
+    cleaned = (url or "").strip()
+    kind = classify_bilibili_target(cleaned)
+    if kind == "space":
+        print("   ❌ 这是空间链接，请改用 --space-url")
+        return None
+    if kind != "video":
+        print("   ❌ 不是有效的 Bilibili 视频链接")
+        return None
+
+    print(f"🔗 获取单个视频: {cleaned}")
+    cmd = [
+        "yt-dlp",
+        *build_cookie_args(cookies_file, cookies_from_browser),
+        "--skip-download",
+        "--no-playlist",
+        "--no-warnings",
+        "-J",
+        cleaned,
+    ]
+    stdout, _, returncode = run_command(cmd, allow_partial=False, timeout=180)
+    if returncode != 0 or not stdout.strip():
+        return None
+
+    video = shared.parse_ytdlp_json_text(stdout)
+    if not video:
+        print("   ❌ 无法解析视频元数据")
+        return None
+    print(f"   {video['title']}")
+    return video
+
+
+def build_single_video_context(
+    video: Dict[str, str],
+    config: shared.AppConfig,
+    override_name: Optional[str] = None,
+) -> shared.ChannelContext:
+    """Build an output folder from uploader metadata, or ``single`` when unknown."""
+    if override_name and override_name.strip():
+        name = shared.sanitize_filename(override_name.strip(), max_length=80).strip(" .") or "single"
+    else:
+        name = shared.folder_name_for_single_video(video.get("channel", ""), video.get("channel_url", ""))
+    channel_url = (video.get("channel_url") or "").strip()
+    if not channel_url and video.get("id"):
+        channel_url = get_video_url(video["id"])
+    return shared.ChannelContext(
+        url=channel_url,
+        name=name,
+        content_root=config.content_root,
+    )
+
+
+def run_single_video(
+    url: str,
+    config: shared.AppConfig,
+    cookies_file: Optional[str],
+    cookies_from_browser: Optional[str],
+    *,
+    override_name: Optional[str] = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> None:
+    """Process one Bilibili URL through the existing process_video path."""
+    video = fetch_single_video(url, cookies_file, cookies_from_browser)
+    if not video:
+        print("❌ 无法获取该视频")
+        return
+
+    context = build_single_video_context(video, config, override_name=override_name)
+    context.subtitles_dir.mkdir(parents=True, exist_ok=True)
+    context.summaries_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 50)
+    print(f"🎬 单视频：{context.name}")
+    print("=" * 50)
+
+    processed = 1 if process_video(
+        video,
+        context,
+        config,
+        cookies_file,
+        cookies_from_browser,
+        dry_run=dry_run,
+        force=force,
+    ) else 0
+
+    print("\n" + "=" * 50)
+    print(f"✅ 完成！处理了 {processed} 个视频")
+    print(f"📂 字幕目录: {context.subtitles_dir}")
+    print(f"📂 摘要目录: {context.summaries_dir}")
+    print("=" * 50)
+
+
 def main() -> None:
     shared.load_dotenv()
     config = load_config()
 
-    parser = argparse.ArgumentParser(description="Bilibili 空间字幕摘要工具")
-    parser.add_argument("--space-url", "-s", default=config.default_channel_url, help="Bilibili 空间 URL")
+    parser = argparse.ArgumentParser(
+        description="Bilibili 空间字幕摘要工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  python3 bilibili_tool.py --url 'https://www.bilibili.com/video/BVxxxx' "
+            "--base-dir /tmp/vault-test\n"
+            "  python3 bilibili_tool.py --url 'https://www.bilibili.com/video/BVxxxx' --dry-run\n"
+        ),
+    )
+    parser.add_argument("--url", help="处理单个 Bilibili 视频 URL（与 --space-url 互斥）")
+    parser.add_argument(
+        "--space-url",
+        "-s",
+        default=None,
+        help=f"Bilibili 空间 URL（默认: {config.default_channel_url}）",
+    )
     parser.add_argument("--name", help="覆盖输出目录名称")
     parser.add_argument("--limit", "-l", type=int, default=config.default_limit, help="处理视频数量")
     parser.add_argument("--base-dir", help="覆盖输出根目录")
@@ -767,6 +921,9 @@ def main() -> None:
     parser.add_argument("--cookies-file", help="Bilibili cookies 文件路径")
     parser.add_argument("--cookies-from-browser", help="从浏览器读取 cookies，例如 chrome、safari")
     args = parser.parse_args()
+
+    if args.url and args.space_url is not None:
+        parser.error("--url 不能与 --space-url 同时使用")
 
     if args.base_dir:
         config = shared.AppConfig(
@@ -795,16 +952,29 @@ def main() -> None:
     )
     cookies_file, temp_cookie_file = normalize_cookie_file(cookies_file)
 
-    context = build_space_context(args.space_url, config, override_name=args.name)
-    context.subtitles_dir.mkdir(parents=True, exist_ok=True)
-    context.summaries_dir.mkdir(parents=True, exist_ok=True)
-
-    print("=" * 50)
-    print(f"🎬 {context.name} Bilibili 视频摘要工具")
-    print("=" * 50)
-
     try:
-        videos = get_space_videos(args.space_url, args.limit, cookies_file, cookies_from_browser)
+        if args.url:
+            run_single_video(
+                args.url,
+                config,
+                cookies_file,
+                cookies_from_browser,
+                override_name=args.name,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+            return
+
+        space_url = args.space_url or config.default_channel_url
+        context = build_space_context(space_url, config, override_name=args.name)
+        context.subtitles_dir.mkdir(parents=True, exist_ok=True)
+        context.summaries_dir.mkdir(parents=True, exist_ok=True)
+
+        print("=" * 50)
+        print(f"🎬 {context.name} Bilibili 视频摘要工具")
+        print("=" * 50)
+
+        videos = get_space_videos(space_url, args.limit, cookies_file, cookies_from_browser)
         if not videos:
             print("❌ 无法获取视频列表")
             return
