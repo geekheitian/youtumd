@@ -1,3 +1,4 @@
+import io
 import json
 import subprocess
 import tempfile
@@ -6,8 +7,16 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+import yaml
+
 import youtumd as tool
 from subscriptions import Glossary
+
+
+def _frontmatter(markdown: str) -> dict:
+    lines = markdown.splitlines()
+    end = lines.index("---", 1)
+    return yaml.safe_load("\n".join(lines[1:end]))
 
 
 class BestPartnersToolTests(unittest.TestCase):
@@ -150,12 +159,181 @@ en English vtt
                 context=context,
                 publish_dates=publish_dates,
             )
-            self.assertIn('channel: BestPartners', markdown)
-            self.assertIn('channel_url: https://www.youtube.com/@BestPartners/videos', markdown)
-            self.assertIn('author: @BestPartners', markdown)
+            self.assertIn('channel: "BestPartners"', markdown)
+            self.assertIn('channel_url: "https://www.youtube.com/@BestPartners/videos"', markdown)
+            self.assertIn('author: "@BestPartners"', markdown)
+            self.assertIn('source: https://www.youtube.com/watch?v=abc123\n', markdown)
             self.assertIn('### 核心主题', markdown)
             self.assertIn('MiniMax-M2.5', markdown)
             self.assertIn('published: 2026-03-01', markdown)
+
+    def test_yaml_quote_escapes_quotes_and_colons_roundtrip(self):
+        title = 'Say "hello": now'
+        self.assertEqual(tool.yaml_quote(title), '"Say \\"hello\\": now"')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(Path(tmpdir))
+            context = tool.build_channel_context('https://www.youtube.com/@BestPartners/videos', config)
+            publish_dates = tool.get_video_dates('20260301')
+            markdown = tool.build_summary_markdown(
+                title=title,
+                video_id='abc123',
+                summary_text='### 核心主题\n测试',
+                provider_name='MiniMax',
+                context=context,
+                publish_dates=publish_dates,
+            )
+            loaded = _frontmatter(markdown)
+            self.assertEqual(loaded['title'], title)
+            self.assertEqual(loaded['source'], 'https://www.youtube.com/watch?v=abc123')
+            self.assertIn('title: "Say \\"hello\\": now"', markdown)
+
+    def test_parse_ytdlp_video_info_matches_channel_loop_shape(self):
+        video = tool.parse_ytdlp_video_info({
+            'id': 'dQw4w9WgxcQ',
+            'title': 'AI: Agents',
+            'upload_date': '20260301',
+            'channel': 'Some Channel',
+            'channel_url': 'https://www.youtube.com/@SomeChannel',
+        })
+        self.assertEqual(video['title'], 'AI: Agents')
+        self.assertEqual(video['id'], 'dQw4w9WgxcQ')
+        self.assertEqual(video['upload_date'], '20260301')
+        self.assertEqual(video['channel'], 'Some Channel')
+
+    def test_parse_ytdlp_video_info_rejects_multi_entry_playlist(self):
+        self.assertIsNone(tool.parse_ytdlp_video_info({
+            '_type': 'playlist',
+            'entries': [{'id': 'a', 'title': 'A'}, {'id': 'b', 'title': 'B'}],
+        }))
+
+    def test_extract_youtube_video_id_accepts_common_urls(self):
+        self.assertEqual(
+            tool.extract_youtube_video_id('https://www.youtube.com/watch?v=dQw4w9WgxcQ&t=12'),
+            'dQw4w9WgxcQ',
+        )
+        self.assertEqual(tool.extract_youtube_video_id('https://youtu.be/dQw4w9WgxcQ'), 'dQw4w9WgxcQ')
+        self.assertEqual(
+            tool.extract_youtube_video_id('https://www.youtube.com/shorts/dQw4w9WgxcQ'),
+            'dQw4w9WgxcQ',
+        )
+        self.assertIsNone(tool.extract_youtube_video_id('https://www.youtube.com/@BestPartners/videos'))
+
+    def test_single_video_context_uses_metadata_or_single_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(Path(tmpdir))
+            named = tool.build_context_for_single_video({
+                'id': 'dQw4w9WgxcQ',
+                'title': 'AI: Agents',
+                'upload_date': '20260301',
+                'channel': 'Some: Channel',
+                'channel_url': 'https://www.youtube.com/@SomeChannel',
+            }, config)
+            unknown = tool.build_context_for_single_video({
+                'id': 'dQw4w9WgxcQ',
+                'title': 'AI: Agents',
+                'upload_date': '',
+                'channel': '',
+                'channel_url': '',
+            }, config)
+            self.assertEqual(named.name, 'Some_ Channel')
+            self.assertNotEqual(named.name, tool.DEFAULT_CHANNEL_NAME)
+            self.assertEqual(named.channel_dir, Path(tmpdir) / '01-内容' / 'Some_ Channel')
+            self.assertEqual(unknown.name, 'single')
+            self.assertEqual(unknown.url, 'https://www.youtube.com/watch?v=dQw4w9WgxcQ')
+
+    def test_fetch_single_video_parses_ytdlp_json(self):
+        payload = json.dumps({
+            'id': 'dQw4w9WgxcQ',
+            'title': 'AI: Agents',
+            'upload_date': '20260301',
+            'channel': 'Some Channel',
+            'channel_url': 'https://www.youtube.com/@SomeChannel',
+        })
+        with mock.patch('youtumd.run_command', return_value=payload) as run:
+            video = tool.fetch_single_video('https://www.youtube.com/watch?v=dQw4w9WgxcQ')
+        self.assertEqual(video['id'], 'dQw4w9WgxcQ')
+        self.assertEqual(video['title'], 'AI: Agents')
+        self.assertIn('-J', run.call_args.args[0])
+        self.assertIsNone(tool.fetch_single_video('https://www.youtube.com/@BestPartners/videos'))
+
+    @mock.patch('youtumd.process_video', return_value=True)
+    @mock.patch('youtumd.fetch_single_video')
+    def test_main_url_mode_reuses_process_video(self, mock_fetch, mock_process):
+        mock_fetch.return_value = {
+            'title': 'AI: Agents',
+            'id': 'dQw4w9WgxcQ',
+            'upload_date': '20260301',
+            'channel': 'Some Channel',
+            'channel_url': 'https://www.youtube.com/@SomeChannel',
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch('sys.argv', [
+                 'youtumd.py',
+                 '--url', 'https://www.youtube.com/watch?v=dQw4w9WgxcQ',
+                 '--base-dir', tmpdir,
+                 '--dry-run',
+             ]):
+            tool.main()
+
+            mock_process.assert_called_once()
+            video, context, _config, dry_run, force = mock_process.call_args.args[:5]
+            self.assertEqual(video['id'], 'dQw4w9WgxcQ')
+            self.assertEqual(video['title'], 'AI: Agents')
+            self.assertEqual(context.name, 'Some Channel')
+            self.assertNotEqual(context.name, 'BestPartners')
+            self.assertTrue(dry_run)
+            self.assertFalse(force)
+            self.assertTrue(context.summaries_dir.exists())
+            self.assertTrue(str(context.summaries_dir).startswith(tmpdir))
+
+    def test_main_url_conflicts_with_channel_and_all_channels(self):
+        cases = [
+            ['youtumd.py', '--url', 'https://www.youtube.com/watch?v=dQw4w9WgxcQ', '--channel', 'https://www.youtube.com/@BestPartners/videos'],
+            ['youtumd.py', '--url', 'https://youtu.be/dQw4w9WgxcQ', '--all-channels'],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv), \
+                 mock.patch('sys.argv', argv), \
+                 mock.patch('sys.stderr', new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as caught:
+                    tool.main()
+            self.assertEqual(caught.exception.code, 2)
+
+    @mock.patch('youtumd.get_channel_videos', return_value=[])
+    @mock.patch('youtumd.fetch_single_video')
+    def test_main_without_url_still_uses_channel_mode(self, mock_fetch, mock_channel):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch('sys.argv', ['youtumd.py', '--base-dir', tmpdir, '--dry-run']):
+            tool.main()
+        mock_fetch.assert_not_called()
+        mock_channel.assert_called_once()
+        self.assertEqual(mock_channel.call_args.args[0], tool.DEFAULT_CHANNEL)
+
+    @mock.patch('youtumd.translate_to_chinese', side_effect=lambda title: title)
+    @mock.patch('youtumd.get_available_subtitles', return_value=[])
+    def test_process_video_skips_existing_source_unless_force(self, mock_subs, _translate):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self.make_config(Path(tmpdir))
+            context = tool.build_channel_context('https://www.youtube.com/@BestPartners/videos', config)
+            context.subtitles_dir.mkdir(parents=True, exist_ok=True)
+            context.summaries_dir.mkdir(parents=True, exist_ok=True)
+            markdown = tool.build_summary_markdown(
+                title='AI: Agents',
+                video_id='abc123',
+                summary_text='### 核心主题\n测试',
+                provider_name='MiniMax',
+                context=context,
+                publish_dates=tool.get_video_dates('20260301'),
+            )
+            (context.summaries_dir / 'note.md').write_text(markdown, encoding='utf-8')
+            video = {'id': 'abc123', 'title': 'AI: Agents', 'upload_date': '20260301'}
+
+            skipped = tool.process_video(video, context, config)
+            self.assertFalse(skipped)
+            mock_subs.assert_not_called()
+
+            tool.process_video(video, context, config, force=True)
+            mock_subs.assert_called_once()
 
     def test_get_video_dates_uses_upload_date_when_available(self):
         dates = tool.get_video_dates('20260315')
@@ -191,6 +369,9 @@ en English vtt
             self.assertFalse(old_path.exists())
             self.assertTrue(Path(saved_path).exists())
             self.assertTrue(saved_path.endswith('测试标题-20260318-字幕.md'))
+            saved = Path(saved_path).read_text(encoding='utf-8')
+            self.assertIn('title: "测试标题"', saved)
+            self.assertIn('source: https://www.youtube.com/watch?v=abc123\n', saved)
 
     def test_save_summary_removes_old_noncanonical_file_on_force_retry(self):
         with tempfile.TemporaryDirectory() as tmpdir:

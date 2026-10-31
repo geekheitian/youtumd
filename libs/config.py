@@ -6,6 +6,7 @@ both the CLI tool (youtumd.py) and the API services.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -106,6 +107,103 @@ class SubtitleOption:
 def sanitize_filename(name: str, max_length: int = 50) -> str:
     """Clean illegal characters from filename."""
     return re.sub(r'[<>:"/\\|?*]', '_', name)[:max_length]
+
+
+def yaml_quote(value: object) -> str:
+    """Return a double-quoted YAML scalar safe for Obsidian frontmatter.
+
+    Bare scalars break when they contain ``:``, ``#``, quotes, or look like
+    booleans, numbers, or null. Callers that match ``source:`` lines exactly
+    should keep those lines unquoted.
+    """
+    text = "" if value is None else str(value)
+    escaped = (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def parse_ytdlp_video_info(data: object) -> Optional[Dict[str, str]]:
+    """Normalize one yt-dlp JSON object into the channel-loop video dict.
+
+    ``title``, ``id``, and ``upload_date`` match ``get_channel_videos``.
+    ``channel`` and ``channel_url`` are extra so a single URL can pick an
+    output folder instead of the default channel.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    entries = data.get("entries")
+    if data.get("_type") in {"playlist", "multi_video"} or (
+        isinstance(entries, list) and not str(data.get("title") or "").strip()
+    ):
+        items = [item for item in (entries or []) if isinstance(item, dict)]
+        if len(items) != 1:
+            return None
+        data = items[0]
+
+    video_id = str(data.get("id") or "").strip()
+    title = str(data.get("title") or "").strip()
+    if not video_id or video_id.upper() == "NA" or not title or title.upper() == "NA":
+        return None
+
+    upload_date = str(data.get("upload_date") or data.get("release_date") or "").strip()
+    if upload_date.upper() == "NA":
+        upload_date = ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", upload_date):
+        upload_date = upload_date.replace("-", "")
+
+    channel = str(data.get("channel") or data.get("uploader") or data.get("creator") or "").strip()
+    if channel.upper() == "NA":
+        channel = ""
+    channel_url = str(data.get("channel_url") or data.get("uploader_url") or "").strip()
+    if channel_url.upper() == "NA":
+        channel_url = ""
+
+    return {
+        "title": title,
+        "id": video_id,
+        "upload_date": upload_date,
+        "channel": channel,
+        "channel_url": channel_url,
+    }
+
+
+def parse_ytdlp_json_text(raw: str) -> Optional[Dict[str, str]]:
+    """Parse yt-dlp JSON stdout into a video dict."""
+    text = (raw or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        data = json.loads(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return parse_ytdlp_video_info(data)
+
+
+def folder_name_for_single_video(
+    channel: str,
+    channel_url: str = "",
+    fallback: str = "single",
+) -> str:
+    """Pick an output folder for one video, never the caller's default channel."""
+    raw = (channel or "").strip()
+    if raw and raw.upper() != "NA":
+        cleaned = sanitize_filename(raw, max_length=80).strip(" .")
+        if cleaned:
+            return cleaned
+    url = (channel_url or "").strip()
+    if url:
+        derived = get_channel_name(url, default_channel_name="").strip(" .")
+        if derived:
+            return derived
+    return fallback or "single"
 
 
 def get_env_path(name: str, default: Path) -> Path:

@@ -130,6 +130,13 @@ python3 youtumd.py --limit 5
 # 处理其他频道
 python3 youtumd.py --channel "https://www.youtube.com/@其他频道/videos"
 
+# 处理单条 YouTube 视频（与 --channel / --all-channels 互斥）
+# 输出目录用视频元数据里的频道名；没有频道名时落到 single/，不会写入默认频道
+python3 youtumd.py --url 'https://www.youtube.com/watch?v=VIDEO_ID' --base-dir /tmp/vault-test
+
+# 只预览这一条，不下载字幕
+python3 youtumd.py --url 'https://www.youtube.com/watch?v=VIDEO_ID' --dry-run
+
 # 强制重新处理已存在的视频
 python3 youtumd.py --force
 
@@ -176,6 +183,8 @@ python3 youtumd.py --content-subdir "01-内容"
 ```yaml
 source: https://www.youtube.com/watch?v=<video_id>
 ```
+
+`source` 保持不带引号，所以旧笔记仍能对上。`title`、`channel`、`author` 等字符串会写成双引号 YAML（例如 `title: "AI: Agents"`），标题里的冒号不会把 Obsidian frontmatter 截断。
 
 也就是说，当前幂等主键是：
 
@@ -247,6 +256,13 @@ source: https://www.youtube.com/watch?v=<video_id>
 
 ```bash
 python3 bilibili_tool.py --space-url "https://space.bilibili.com/50247550/video"
+```
+
+处理单条视频（与 `--space-url` 互斥）。目录名优先用 UP 主名称，否则使用 `single`：
+
+```bash
+python3 bilibili_tool.py --url 'https://www.bilibili.com/video/BV1xx411c7mD' --base-dir /tmp/vault-test
+python3 bilibili_tool.py --url 'https://www.bilibili.com/video/BV1xx411c7mD' --dry-run
 ```
 
 常用参数：
